@@ -1,302 +1,637 @@
 """
-EGGROLL (Evolution Guided General Revolution Optimization via Low-rank Learning)
-Bước 1: Initialization - Chuẩn bị mô hình và hyperparameters
+EGGROLL Initialization for Translation Model Finetuning (PyTorch Implementation)
+
+Based on the official implementation from:
+https://github. com/ESHyperscale/HyperscaleES/blob/main/llm_experiments/general_do_evolution_multi_gpu.py
+
+This module implements Step 1: Initialization of the EGGROLL algorithm
+for finetuning a Transformer-based translation model. 
 """
 
 import torch
 import torch.nn as nn
-from dataclasses import dataclass
-from typing import Optional, Dict, Any
-from transformers import (
-    AutoModelForSeq2SeqLM,
-    AutoTokenizer,
-    PreTrainedModel
-)
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, Tuple, Literal
+from pathlib import Path
+import numpy as np
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from datetime import datetime
 
 
-@dataclass
-class EGGROLLConfig:
-    """
-    Cấu hình hyperparameters cho EGGROLL. 
-    
-    Attributes:
-        sigma: Độ lệch chuẩn của nhiễu (noise standard deviation)
-        alpha: Tốc độ học (learning rate)
-        population_size: Kích thước quần thể N - số lượng biến thể mô hình
-        rank: Hạng r của ma trận nhiễu low-rank (r << d)
-        use_antithetic: Sử dụng Antithetic Sampling để giảm phương sai
-        target_modules: Các module sẽ được finetune (None = tất cả linear layers)
-        seed: Random seed để tái tạo kết quả
-    """
-    sigma: float = 0.01
-    alpha: float = 1e-3
-    population_size: int = 64
-    rank: int = 16
-    use_antithetic: bool = True
-    target_modules: Optional[list] = None
-    seed: Optional[int] = 42
-    
-    def __post_init__(self):
-        """Validate hyperparameters."""
-        assert self.sigma > 0, "sigma phải > 0"
-        assert self.alpha > 0, "alpha phải > 0"
-        assert self.population_size > 0, "population_size phải > 0"
-        assert self.rank > 0, "rank phải > 0"
-        
-        if self.use_antithetic:
-            # Với antithetic sampling, population_size phải là số chẵn
-            assert self.population_size % 2 == 0, \
-                "population_size phải là số chẵn khi dùng antithetic sampling"
-
+# ============================================================================
+# Configuration Dataclass (adapted from Args in original code)
+# ============================================================================
 
 @dataclass
-class ParameterInfo:
+class EggrollConfig:
     """
-    Thông tin về một tham số cần finetune.
+    Configuration for EGGROLL finetuning. 
     
-    Attributes:
-        name: Tên của parameter
-        shape: Kích thước của parameter (d1, d2)
-        dtype: Kiểu dữ liệu
-        device: Device (cpu/cuda)
-        original_param: Reference đến parameter gốc
+    Hyperparameters following the paper "Evolution Strategies at Hyperscale"
     """
-    name: str
-    shape: tuple
-    dtype: torch.dtype
-    device: torch.device
-    original_param: nn.Parameter
+    # Random seed for reproducibility
+    seed: int = 0
+    
+    # Model configuration
+    model_name: str = "Helsinki-NLP/opus-mt-en-vi"  # Translation model
+    dtype: Optional[str] = "float32"  # "float32", "float16", "bfloat16"
+    
+    # EGGROLL core hyperparameters
+    sigma: float = 1e-3              # Noise standard deviation (σ)
+    lr_scale: float = 1.0            # Learning rate scale (α)
+    rank: int = 16                   # Low-rank dimension (r << d)
+    
+    # Population and batch settings
+    population_size: int = 64        # N: Number of perturbed models per iteration
+    generations_per_prompt: int = 8  # Number of generations per unique prompt
+    
+    # Training settings
+    num_epochs: int = 100
+    validate_every: int = 10
+    save_every: int = 100
+    log_output_every: int = 10
+    
+    # Generation settings
+    generation_length: int = 100
+    thinking_length: int = 100
+    answer_length: int = 100
+    temperature: float = 0.0
+    val_temperature: float = 0.0
+    
+    # Noiser settings
+    noise_reuse: int = 1             # Number of times to reuse noise
+    freeze_nonlora: bool = True      # Whether to freeze non-LoRA parameters
+    
+    # Paths
+    output_directory: Optional[str] = "."
+    save_path: Optional[str] = "."
+    load_path: Optional[str] = None
+    save_model: bool = True
+    load_model: bool = False
+    
+    # Device settings
+    device: str = "cuda" if torch.cuda. is_available() else "cpu"
+    num_gpus: int = 1
+    parallel_generations_per_gpu: int = 32
 
 
-class EGGROLLInitializer:
+# ============================================================================
+# Optimizer State (adapted from optax pattern)
+# ============================================================================
+
+@dataclass
+class OptimizerState:
+    """State for the optimizer (similar to optax optimizer state)"""
+    step: int = 0
+    momentum: Optional[Dict[str, torch.Tensor]] = None
+    velocity: Optional[Dict[str, torch. Tensor]] = None
+
+
+# ============================================================================
+# EGGROLL Noiser Parameters
+# ============================================================================
+
+@dataclass
+class FrozenNoiserParams:
     """
-    Class khởi tạo EGGROLL cho Translation Model.
+    Frozen (constant) parameters for EGGROLL noiser.
+    These don't change during training. 
+    """
+    group_size: int                  # Number of samples per group for normalization
+    freeze_nonlora: bool             # Whether to freeze non-LoRA parameters
+    noise_reuse: int                 # Number of times to reuse noise
+    rank: int                        # Low-rank dimension r
+    solver_type: str = "sgd"         # Optimizer type: "sgd" or "adam"
+    solver_kwargs: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass  
+class NoiserParams:
+    """
+    Mutable parameters for EGGROLL noiser. 
+    These are updated during training. 
+    """
+    sigma: float                     # Current noise standard deviation
+    opt_state: OptimizerState        # Optimizer state
+
+
+# ============================================================================
+# Parameter Classification Map (for ES updates)
+# ============================================================================
+
+class ESMapType:
+    """Classification of parameters for ES updates"""
+    FULL = 0      # Full parameter update (non-LoRA)
+    LORA = 1      # LoRA-style low-rank update
+    FROZEN = 2    # Frozen, no update
+    NOOP = 3      # No operation
+
+
+# ============================================================================
+# EGGROLL Noiser Class (PyTorch Implementation)
+# ============================================================================
+
+class EggrollNoiser:
+    """
+    EGGROLL Noiser for Evolution Strategies.
     
-    Quản lý việc:
-    - Load pre-trained model
-    - Freeze parameters
-    - Xác định các layers cần finetune
-    - Thiết lập cấu trúc low-rank
+    Implements low-rank perturbations for memory-efficient ES on large models.
+    
+    Key idea: Instead of storing full perturbation matrix ε of size (d x d),
+    we store two smaller matrices A (d x r) and B (d x r) where r << d,
+    such that ε ≈ A @ B. T
     """
     
-    def __init__(
-        self,
-        model_name_or_path: str,
-        config: EGGROLLConfig,
-        device: Optional[str] = None
-    ):
+    @classmethod
+    def init_noiser(
+        cls,
+        params: Dict[str, torch.Tensor],
+        sigma: float,
+        lr: float,
+        solver: str = "sgd",
+        solver_kwargs: Optional[Dict[str, Any]] = None,
+        group_size: int = 0,
+        freeze_nonlora: bool = False,
+        noise_reuse: int = 0,
+        rank: int = 1,
+        device: str = "cuda"
+    ) -> Tuple[FrozenNoiserParams, NoiserParams]:
         """
-        Khởi tạo EGGROLL.
+        Initialize the EGGROLL noiser. 
+        
+        Adapted from EggRoll. init_noiser in the original JAX implementation.
         
         Args:
-            model_name_or_path: Tên hoặc đường dẫn đến pre-trained model
-            config: Cấu hình EGGROLL
-            device: Device để load model ('cuda', 'cpu', hoặc None để tự động)
+            params: Dictionary of model parameters {name: tensor}
+            sigma: Noise standard deviation (σ)
+            lr: Learning rate (α)
+            solver: Optimizer type ("sgd" or "adam")
+            solver_kwargs: Additional optimizer arguments
+            group_size: Number of samples per group for fitness normalization
+            freeze_nonlora: Whether to freeze non-LoRA parameters
+            noise_reuse: Number of times to reuse noise patterns
+            rank: Low-rank dimension r for perturbations
+            device: Device to use for tensors
+            
+        Returns:
+            frozen_noiser_params: Constant noiser configuration
+            noiser_params: Mutable noiser state
         """
-        self.config = config
-        self.device = device or ('cuda' if torch. cuda.is_available() else 'cpu')
+        if solver_kwargs is None:
+            solver_kwargs = {}
         
-        # Set random seed cho reproducibility
-        if config.seed is not None:
-            torch.manual_seed(config.seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(config.seed)
+        # Initialize optimizer state (momentum/velocity buffers)
+        opt_state = cls._init_optimizer_state(params, solver, device)
         
-        # Load model và tokenizer
-        print(f"[Bước 1. 1] Loading pre-trained model: {model_name_or_path}")
-        self.model = self._load_model(model_name_or_path)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-        
-        # Freeze tất cả parameters
-        print("[Bước 1.2] Freezing all model parameters...")
-        self._freeze_model()
-        
-        # Xác định các parameters sẽ được perturb
-        print("[Bước 1.3] Identifying target parameters for low-rank perturbation...")
-        self. target_params = self._identify_target_parameters()
-        
-        # Tính toán và hiển thị thống kê
-        self._print_statistics()
-    
-    def _load_model(self, model_name_or_path: str) -> PreTrainedModel:
-        """Load pre-trained translation model."""
-        model = AutoModelForSeq2SeqLM.from_pretrained(
-            model_name_or_path,
-            torch_dtype=torch.float32,  # Có thể đổi sang float16 để tiết kiệm memory
-        )
-        model = model.to(self.device)
-        model.eval()  # Set evaluation mode
-        return model
-    
-    def _freeze_model(self):
-        """Freeze tất cả parameters - ES không cần gradient."""
-        for param in self.model. parameters():
-            param.requires_grad = False
-    
-    def _identify_target_parameters(self) -> Dict[str, ParameterInfo]:
-        """
-        Xác định các parameters sẽ được perturb với low-rank matrices.
-        
-        Mặc định: Tất cả Linear layers (nn.Linear) trong Transformer. 
-        Có thể customize qua config.target_modules. 
-        """
-        target_params = {}
-        
-        for name, module in self.model. named_modules():
-            # Chỉ xét Linear layers (hoặc các modules được chỉ định)
-            if isinstance(module, nn. Linear):
-                # Kiểm tra nếu có target_modules filter
-                if self. config.target_modules is not None:
-                    if not any(target in name for target in self.config.target_modules):
-                        continue
-                
-                # Lưu thông tin parameter weight
-                param = module.weight
-                param_info = ParameterInfo(
-                    name=f"{name}.weight",
-                    shape=param.shape,
-                    dtype=param.dtype,
-                    device=param. device,
-                    original_param=param
-                )
-                target_params[f"{name}.weight"] = param_info
-        
-        return target_params
-    
-    def _print_statistics(self):
-        """In thống kê về model và EGGROLL configuration."""
-        # Tổng số parameters của model
-        total_params = sum(p.numel() for p in self.model.parameters())
-        
-        # Số parameters sẽ được perturb
-        target_params_count = sum(
-            info.shape[0] * info.shape[1] 
-            for info in self.target_params. values()
+        # Create frozen parameters (constants)
+        frozen_noiser_params = FrozenNoiserParams(
+            group_size=group_size,
+            freeze_nonlora=freeze_nonlora,
+            noise_reuse=noise_reuse,
+            rank=rank,
+            solver_type=solver,
+            solver_kwargs={"lr": lr, **solver_kwargs}
         )
         
-        # Memory tiết kiệm được với low-rank
-        # Full perturbation: N * target_params_count * 4 bytes (float32)
-        # Low-rank: N * sum((d1 + d2) * r) * 4 bytes
-        full_memory = self.config.population_size * target_params_count * 4
-        lowrank_memory = self.config.population_size * sum(
-            (info.shape[0] + info.shape[1]) * self. config.rank * 4
-            for info in self.target_params. values()
+        # Create mutable noiser parameters
+        noiser_params = NoiserParams(
+            sigma=sigma,
+            opt_state=opt_state
         )
-        memory_saved_ratio = (1 - lowrank_memory / full_memory) * 100
         
-        print("\n" + "="*60)
-        print("EGGROLL INITIALIZATION COMPLETE")
-        print("="*60)
-        print(f"\n📊 Model Statistics:")
-        print(f"   - Total parameters: {total_params:,}")
-        print(f"   - Target parameters (for perturbation): {target_params_count:,}")
-        print(f"   - Number of target layers: {len(self.target_params)}")
-        
-        print(f"\n⚙️  EGGROLL Hyperparameters:")
-        print(f"   - σ (noise std): {self.config.sigma}")
-        print(f"   - α (learning rate): {self.config.alpha}")
-        print(f"   - N (population size): {self.config.population_size}")
-        print(f"   - r (rank): {self.config. rank}")
-        print(f"   - Antithetic sampling: {self.config.use_antithetic}")
-        
-        print(f"\n💾 Memory Efficiency:")
-        print(f"   - Full perturbation memory: {full_memory / 1e9:.2f} GB")
-        print(f"   - Low-rank perturbation memory: {lowrank_memory / 1e9:. 4f} GB")
-        print(f"   - Memory saved: {memory_saved_ratio:.2f}%")
-        print("="*60 + "\n")
+        return frozen_noiser_params, noiser_params
     
-    def get_parameter_shapes(self) -> Dict[str, tuple]:
-        """Trả về dictionary mapping tên parameter -> shape."""
-        return {name: info.shape for name, info in self.target_params.items()}
-    
-    def get_original_parameters(self) -> Dict[str, torch.Tensor]:
-        """
-        Trả về bản sao của parameters gốc θ.
-        Dùng làm baseline cho perturbation.
-        """
-        return {
-            name: info.original_param. data.clone()
-            for name, info in self.target_params.items()
-        }
+    @classmethod
+    def _init_optimizer_state(
+        cls,
+        params: Dict[str, torch.Tensor],
+        solver: str,
+        device: str
+    ) -> OptimizerState:
+        """Initialize optimizer state (momentum/velocity buffers)"""
+        opt_state = OptimizerState(step=0)
+        
+        if solver == "adam":
+            # Adam needs both momentum and velocity
+            opt_state.momentum = {
+                name: torch.zeros_like(p, device=device)
+                for name, p in params.items()
+            }
+            opt_state.velocity = {
+                name: torch.zeros_like(p, device=device)
+                for name, p in params.items()
+            }
+        elif solver == "sgd_momentum":
+            # SGD with momentum only needs momentum buffer
+            opt_state.momentum = {
+                name: torch. zeros_like(p, device=device)
+                for name, p in params.items()
+            }
+            
+        return opt_state
 
 
-def initialize_eggroll(
-    model_name: str = "Helsinki-NLP/opus-mt-en-vi",
-    sigma: float = 0.01,
-    alpha: float = 1e-3,
-    population_size: int = 64,
-    rank: int = 16,
-    use_antithetic: bool = True,
-    target_modules: Optional[list] = None,
-    seed: int = 42
-) -> EGGROLLInitializer:
+# ============================================================================
+# Parameter ES Map Builder
+# ============================================================================
+
+def build_es_map(
+    model: nn.Module,
+    freeze_embeddings: bool = True,
+    freeze_layer_norm: bool = True,
+    lora_target_modules: Optional[list] = None
+) -> Dict[str, int]:
     """
-    Convenience function để khởi tạo EGGROLL cho Translation Model.
+    Build ES classification map for model parameters.
+    
+    Determines which parameters get:
+    - FULL updates (standard ES)
+    - LORA updates (low-rank ES via EGGROLL)
+    - FROZEN (no updates)
     
     Args:
-        model_name: Tên pre-trained model (ví dụ: Helsinki-NLP/opus-mt-en-vi)
-        sigma: Độ lệch chuẩn của nhiễu
-        alpha: Learning rate
-        population_size: Kích thước quần thể
-        rank: Hạng của low-rank matrices
-        use_antithetic: Sử dụng antithetic sampling
-        target_modules: List các module names để filter (None = all linear layers)
-        seed: Random seed
-    
+        model: The neural network model
+        freeze_embeddings: Whether to freeze embedding layers
+        freeze_layer_norm: Whether to freeze layer normalization
+        lora_target_modules: List of module names to apply LoRA updates
+        
     Returns:
-        EGGROLLInitializer instance đã được khởi tạo
-    
-    Example:
-        >>> eggroll = initialize_eggroll(
-        ...     model_name="Helsinki-NLP/opus-mt-en-vi",
-        ...      sigma=0. 01,
-        ...      alpha=1e-3,
-        ...     population_size=64,
-        ...     rank=16
-        ... )
+        es_map: Dictionary mapping parameter names to ESMapType
     """
-    config = EGGROLLConfig(
-        sigma=sigma,
-        alpha=alpha,
-        population_size=population_size,
-        rank=rank,
-        use_antithetic=use_antithetic,
-        target_modules=target_modules,
-        seed=seed
+    if lora_target_modules is None:
+        # Default: apply LoRA to attention and FFN weight matrices
+        lora_target_modules = [
+            "q_proj", "k_proj", "v_proj", "out_proj",  # Attention
+            "fc1", "fc2",  # FFN
+            "self_attn", "encoder_attn",  # For MarianMT / OPUS models
+        ]
+    
+    es_map = {}
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            es_map[name] = ESMapType. FROZEN
+            continue
+            
+        # Check if embedding layer
+        if "embed" in name. lower():
+            es_map[name] = ESMapType. FROZEN if freeze_embeddings else ESMapType. FULL
+            continue
+            
+        # Check if layer norm
+        if "layer_norm" in name.lower() or "layernorm" in name.lower():
+            es_map[name] = ESMapType.FROZEN if freeze_layer_norm else ESMapType. FULL
+            continue
+            
+        # Check if bias (biases typically get full updates or frozen)
+        if "bias" in name. lower():
+            es_map[name] = ESMapType. FULL
+            continue
+            
+        # Check if target for LoRA updates (weight matrices)
+        is_lora_target = any(target in name.lower() for target in lora_target_modules)
+        if is_lora_target and "weight" in name.lower():
+            es_map[name] = ESMapType.LORA
+        else:
+            es_map[name] = ESMapType. FULL
+            
+    return es_map
+
+
+# ============================================================================
+# Random Key Generation (similar to JAX's key splitting)
+# ============================================================================
+
+class RandomKeyGenerator:
+    """
+    Random key generator for reproducible noise generation.
+    Similar to JAX's random key system. 
+    """
+    
+    def __init__(self, seed: int):
+        self.base_seed = seed
+        self.generator = torch.Generator()
+        self.generator.manual_seed(seed)
+        
+    def fold_in(self, key_id: int) -> 'RandomKeyGenerator':
+        """Create a new key by folding in an additional integer"""
+        new_gen = RandomKeyGenerator(self. base_seed)
+        new_gen.generator.manual_seed(self.base_seed + key_id * 31337)
+        return new_gen
+    
+    def split(self, num_keys: int) -> list:
+        """Split into multiple independent keys"""
+        return [self.fold_in(i) for i in range(num_keys)]
+    
+    @property
+    def seed(self) -> int:
+        """Get current seed for this key"""
+        return self. base_seed
+
+
+def simple_es_tree_key(
+    params: Dict[str, torch.Tensor],
+    base_key: RandomKeyGenerator,
+    scan_map: Optional[Dict[str, int]] = None
+) -> Dict[str, RandomKeyGenerator]:
+    """
+    Generate a tree of random keys matching the parameter structure.
+    
+    Each parameter gets its own independent random key for noise generation.
+    
+    Args:
+        params: Dictionary of model parameters
+        base_key: Base random key generator
+        scan_map: Optional scan map (for scanned/stacked layers)
+        
+    Returns:
+        Dictionary mapping parameter names to random keys
+    """
+    keys = {}
+    for i, name in enumerate(params. keys()):
+        keys[name] = base_key.fold_in(i)
+    return keys
+
+
+# ============================================================================
+# Main Initialization Function
+# ============================================================================
+
+def initialize_eggroll(
+    config: EggrollConfig
+) -> Tuple[
+    nn.Module,                      # model
+    Dict[str, torch.Tensor],        # params
+    FrozenNoiserParams,             # frozen_noiser_params  
+    NoiserParams,                   # noiser_params
+    Dict[str, int],                 # es_map
+    Dict[str, RandomKeyGenerator],  # base_evo_keys
+    Any,                            # tokenizer
+]:
+    """
+    Initialize EGGROLL for finetuning a translation model.
+    
+    This implements Step 1 of the EGGROLL algorithm as described in
+    "Evolution Strategies at Hyperscale" (arXiv:2511.16652). 
+    
+    Args:
+        config: EGGROLL configuration
+        
+    Returns:
+        model: Pre-trained translation model
+        params: Dictionary of model parameters
+        frozen_noiser_params: Frozen noiser configuration
+        noiser_params: Mutable noiser state
+        es_map: Parameter classification for ES updates
+        base_evo_keys: Random keys for each parameter
+        tokenizer: Model tokenizer
+    """
+    print("=" * 60)
+    print("EGGROLL Initialization")
+    print("=" * 60)
+    
+    # -------------------------------------------------------------------------
+    # 1. Set random seeds for reproducibility
+    # -------------------------------------------------------------------------
+    print(f"\n[1] Setting random seed: {config.seed}")
+    torch.manual_seed(config. seed)
+    np.random.seed(config.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(config.seed)
+    
+    master_key = RandomKeyGenerator(config.seed)
+    base_model_key = master_key.fold_in(0)
+    base_gen_key = master_key.fold_in(1)
+    base_valid_key = master_key.fold_in(2)
+    
+    # -------------------------------------------------------------------------
+    # 2. Load pre-trained translation model
+    # -------------------------------------------------------------------------
+    print(f"\n[2] Loading pre-trained model: {config.model_name}")
+    
+    # Determine dtype
+    dtype_map = {
+        "float32": torch. float32,
+        "float16": torch.float16,
+        "bfloat16": torch. bfloat16,
+    }
+    torch_dtype = dtype_map.get(config.dtype, torch. float32)
+    
+    # Load model and tokenizer
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        config.model_name,
+        torch_dtype=torch_dtype,
+    ). to(config.device)
+    
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    
+    print(f"   Model loaded: {model.__class__.__name__}")
+    print(f"   Device: {config.device}")
+    print(f"   Dtype: {torch_dtype}")
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in model. parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"   Total parameters: {total_params:,}")
+    print(f"   Trainable parameters: {trainable_params:,}")
+    
+    # -------------------------------------------------------------------------
+    # 3. Extract parameters as dictionary
+    # -------------------------------------------------------------------------
+    print(f"\n[3] Extracting model parameters")
+    
+    params = {name: param. data.clone() for name, param in model.named_parameters()}
+    print(f"   Number of parameter tensors: {len(params)}")
+    
+    # -------------------------------------------------------------------------
+    # 4. Build ES classification map
+    # -------------------------------------------------------------------------
+    print(f"\n[4] Building ES parameter classification map")
+    
+    es_map = build_es_map(
+        model,
+        freeze_embeddings=True,
+        freeze_layer_norm=True,
     )
     
-    return EGGROLLInitializer(
-        model_name_or_path=model_name,
-        config=config
+    # Count by type
+    type_counts = {
+        "FULL": sum(1 for v in es_map. values() if v == ESMapType. FULL),
+        "LORA": sum(1 for v in es_map. values() if v == ESMapType. LORA),
+        "FROZEN": sum(1 for v in es_map. values() if v == ESMapType. FROZEN),
+    }
+    print(f"   FULL updates: {type_counts['FULL']} parameters")
+    print(f"   LORA updates: {type_counts['LORA']} parameters")
+    print(f"   FROZEN: {type_counts['FROZEN']} parameters")
+    
+    # -------------------------------------------------------------------------
+    # 5.  Initialize EGGROLL Noiser
+    # -------------------------------------------------------------------------
+    print(f"\n[5] Initializing EGGROLL Noiser")
+    print(f"   Sigma (σ): {config. sigma}")
+    print(f"   Learning rate scale (α): {config.lr_scale}")
+    print(f"   Low-rank dimension (r): {config. rank}")
+    print(f"   Population size (N): {config.population_size}")
+    print(f"   Freeze non-LoRA: {config.freeze_nonlora}")
+    
+    frozen_noiser_params, noiser_params = EggrollNoiser. init_noiser(
+        params=params,
+        sigma=config.sigma,
+        lr=config.lr_scale,
+        solver="sgd",
+        group_size=config. generations_per_prompt,
+        freeze_nonlora=config. freeze_nonlora,
+        noise_reuse=config. noise_reuse,
+        rank=config.rank,
+        device=config.device,
+    )
+    
+    # -------------------------------------------------------------------------
+    # 6. Generate random keys for each parameter
+    # -------------------------------------------------------------------------
+    print(f"\n[6] Generating random keys for parameters")
+    
+    base_evo_keys = simple_es_tree_key(params, base_model_key)
+    print(f"   Generated {len(base_evo_keys)} random keys")
+    
+    # -------------------------------------------------------------------------
+    # 7.  Compute derived settings
+    # -------------------------------------------------------------------------
+    print(f"\n[7] Computing derived settings")
+    
+    config.generation_length = config. thinking_length + config.answer_length
+    
+    total_devices = config.num_gpus
+    config.total_parallel_generations = total_devices * config. parallel_generations_per_gpu
+    config.prompts_per_epoch = config.total_parallel_generations // config.generations_per_prompt
+    
+    print(f"   Total parallel generations: {config. total_parallel_generations}")
+    print(f"   Prompts per epoch: {config.prompts_per_epoch}")
+    print(f"   Generation length: {config. generation_length}")
+    
+    # -------------------------------------------------------------------------
+    # 8. Optional: Load from checkpoint
+    # -------------------------------------------------------------------------
+    if config.load_model and config.load_path:
+        print(f"\n[8] Loading checkpoint from: {config.load_path}")
+        checkpoint = torch.load(config.load_path, map_location=config.device)
+        
+        if "params" in checkpoint:
+            params = checkpoint["params"]
+            model.load_state_dict({k: v for k, v in params. items()})
+        if "noiser_params" in checkpoint:
+            noiser_params = checkpoint["noiser_params"]
+        if "es_map" in checkpoint:
+            es_map = checkpoint["es_map"]
+            
+        print("   Checkpoint loaded successfully")
+    
+    # -------------------------------------------------------------------------
+    # Summary
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("EGGROLL Initialization Complete!")
+    print("=" * 60)
+    print(f"""
+Summary:
+--------
+• Model: {config. model_name}
+• Parameters: {total_params:,} total, {trainable_params:,} trainable
+• EGGROLL Config:
+  - σ (sigma): {config.sigma}
+  - α (learning rate): {config.lr_scale}
+  - r (rank): {config.rank}
+  - N (population): {config.population_size}
+• ES Map: {type_counts['LORA']} LoRA, {type_counts['FULL']} Full, {type_counts['FROZEN']} Frozen
+• Device: {config.device}
+""")
+    
+    return (
+        model,
+        params,
+        frozen_noiser_params,
+        noiser_params,
+        es_map,
+        base_evo_keys,
+        tokenizer,
     )
 
 
-# ============================================================
-# EXAMPLE USAGE
-# ============================================================
+# ============================================================================
+# Utility: Save/Load Checkpoints
+# ============================================================================
+
+def save_checkpoint(
+    path: str,
+    params: Dict[str, torch.Tensor],
+    frozen_noiser_params: FrozenNoiserParams,
+    noiser_params: NoiserParams,
+    es_map: Dict[str, int],
+    epoch: int = 0,
+):
+    """Save EGGROLL checkpoint"""
+    Path(path).parent. mkdir(parents=True, exist_ok=True)
+    
+    checkpoint = {
+        "params": params,
+        "frozen_noiser_params": frozen_noiser_params,
+        "noiser_params": noiser_params,
+        "es_map": es_map,
+        "epoch": epoch,
+        "timestamp": datetime.now(). isoformat(),
+    }
+    
+    torch.save(checkpoint, path)
+    print(f"Checkpoint saved to: {path}")
+
+
+def load_checkpoint(path: str, device: str = "cuda"):
+    """Load EGGROLL checkpoint"""
+    checkpoint = torch.load(path, map_location=device)
+    return checkpoint
+
+
+# ============================================================================
+# Example Usage
+# ============================================================================
+
 if __name__ == "__main__":
-    # Ví dụ 1: Khởi tạo với model dịch Anh-Việt
-    print("🚀 Initializing EGGROLL for English-Vietnamese Translation Model\n")
-    
-    eggroll = initialize_eggroll(
-        model_name="Helsinki-NLP/opus-mt-en-vi",  # Model dịch Anh -> Việt
-        sigma=0.01,           # Noise standard deviation
-        alpha=1e-3,           # Learning rate
-        population_size=64,   # Số candidates mỗi iteration
-        rank=16,              # Low-rank dimension
-        use_antithetic=True,  # Giảm variance
-        seed=42
+    # Create configuration
+    config = EggrollConfig(
+        # Model
+        model_name="Helsinki-NLP/opus-mt-en-vi",  # English to Vietnamese
+        
+        # EGGROLL hyperparameters (from paper)
+        sigma=1e-3,           # Noise standard deviation
+        lr_scale=1.0,         # Learning rate
+        rank=16,              # Low-rank dimension (r << d)
+        
+        # Population settings
+        population_size=64,   # N: number of perturbed models
+        generations_per_prompt=8,
+        
+        # Training
+        num_epochs=100,
+        freeze_nonlora=True,  # Only update LoRA-style parameters
+        
+        # Device
+        device="cuda" if torch.cuda. is_available() else "cpu",
     )
     
-    # Truy cập các thành phần
-    print("📝 Accessible components:")
-    print(f"   - Model: {type(eggroll. model).__name__}")
-    print(f"   - Tokenizer: {type(eggroll.tokenizer).__name__}")
-    print(f"   - Config: {eggroll.config}")
-    print(f"   - Number of target params: {len(eggroll.target_params)}")
+    # Initialize EGGROLL
+    (
+        model,
+        params,
+        frozen_noiser_params,
+        noiser_params,
+        es_map,
+        base_evo_keys,
+        tokenizer,
+    ) = initialize_eggroll(config)
     
-    # Lấy shapes để chuẩn bị cho Bước 2 (tạo low-rank matrices)
-    param_shapes = eggroll.get_parameter_shapes()
-    print(f"\n📐 First 5 parameter shapes (for low-rank matrix generation):")
-    for i, (name, shape) in enumerate(list(param_shapes. items())[:5]):
-        print(f"   {name}: {shape} -> A: ({shape[0]}, {eggroll.config. rank}), B: ({shape[1]}, {eggroll.config. rank})")
+    # Now ready for Step 2: Low-Rank Perturbation Generation
+    print("\nReady for Step 2: Generate Low-Rank Perturbations!")
+    print(f"Next: For each of the {config.population_size} population members:")
+    print(f"  - Sample A_i of size (d × {config.rank})")
+    print(f"  - Sample B_i of size (d × {config. rank})")
+    print(f"  - Apply perturbation: θ_i = θ + σ(A_i × B_i^T)")
