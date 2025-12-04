@@ -1524,7 +1524,91 @@ def main():
     # Example configuration
     config = EggrollTrainerConfig(
         # Model
-        model_name="/home/jovyan/nmt-srv-shared/users/binh/grpo_training/transflow/0_Base/en-vi-2. 1. 10. 04-grpo-100k",
+        model_name="/home/jovyan/nmt-srv-shared/users/binh/grpo_training/transflow/0_Base/en-vi-2. 1. 10.04-grpo-100k",
         
         # EGGROLL hyperparameters
-        sigma=
+        sigma=1e-3,
+        lr_scale=1.0,
+        rank=16,
+        
+        # Population settings
+        generations_per_prompt=8,
+        parallel_generations_per_gpu=256,  # Mỗi GPU xử lý 256 generations
+        
+        # Training settings
+        num_epochs=100,
+        validate_every=10,
+        save_every=20,
+        log_every=1,
+        
+        # Validation
+        validation_samples=100,
+        
+        # Optimizer
+        optimizer_type="sgd",
+        momentum=0.0,
+        
+        # Reward
+        reward_metric="bleu",
+        fitness_shaping="centered_rank",
+        
+        # Paths
+        output_directory="/home/jovyan/nmt-srv-shared/users/binh/EGGROLL/outputs",
+        save_path="/home/jovyan/nmt-srv-shared/users/binh/EGGROLL/checkpoints",
+        
+        # Distributed settings
+        distributed=True,
+        backend="nccl",
+        
+        # Logging
+        track=False,  # Set True để enable wandb
+        wandb_project="EGGROLL-Translation",
+        wandb_name="eggroll-multi-gpu",
+    )
+    
+    # Load training data
+    src_train_path = "/home/jovyan/nmt-srv-shared/users/binh/eggroll_training/dataset/train.src"
+    tgt_train_path = "/home/jovyan/nmt-srv-shared/users/binh/eggroll_training/dataset/train.tgt"
+    src_valid_path = "/home/jovyan/nmt-srv-shared/users/binh/eggroll_training/dataset/valid.src"
+    tgt_valid_path = "/home/jovyan/nmt-srv-shared/users/binh/eggroll_training/dataset/valid. tgt"
+    
+    # Chỉ print trên rank 0
+    is_main = not dist.is_initialized() or dist.get_rank() == 0
+    
+    if is_main:
+        print("Loading datasets...")
+    
+    with open(src_train_path, "r", encoding='utf-8') as f:
+        src_train = f. readlines()
+    with open(tgt_train_path, "r", encoding='utf-8') as f:
+        tgt_train = f. readlines()
+    with open(src_valid_path, "r", encoding='utf-8') as f:
+        src_valid = f.readlines()
+    with open(tgt_valid_path, "r", encoding='utf-8') as f:
+        tgt_valid = f. readlines()
+    
+    train_data = [
+        (src. strip(), tgt. strip()) 
+        for src, tgt in zip(src_train, tgt_train)
+    ]
+    valid_data = [
+        (src.strip(), tgt.strip()) 
+        for src, tgt in zip(src_valid, tgt_valid)
+    ]
+    
+    if is_main:
+        print(f"  Train samples: {len(train_data)}")
+        print(f"  Valid samples: {len(valid_data)}")
+    
+    # Create trainer
+    trainer = EggrollMultiGPUTrainer(config)
+    
+    # Setup
+    trainer.setup()
+    
+    # Train
+    trainer. train(train_data, valid_data)
+
+
+if __name__ == "__main__":
+    main()
